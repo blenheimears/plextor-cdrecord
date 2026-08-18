@@ -1,3 +1,7 @@
+The binaries and all modifications to original cdrecord code are under the CDDL license.
+
+All new functions including the crypto code is under this license (public domain):
+
 Creative Commons Legal Code
 
 CC0 1.0 Universal
