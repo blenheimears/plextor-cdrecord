@@ -1,5 +1,6 @@
 # plextor-cdrecord
 Patches for cdrecord to support Plextor drives with locked commands (Premium 2, PX-755, PX-760)
+Works on an unmodified drive with stock firmware. You do NOT need the "free your Plextor" firmware to use this.
 
 This has only been tested on a Plextor Premium 2.
 
