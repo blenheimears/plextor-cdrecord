@@ -1,0 +1,670 @@
+diff --git a/cdrecord/Makefile b/cdrecord/Makefile
+index be72a8e..e0d2f9f 100644
+--- a/cdrecord/Makefile
++++ b/cdrecord/Makefile
+@@ -34,7 +34,7 @@ CFILES=		cdrecord.c \
+ 		sector.c clone.c \
+ 		movesect.c subchan.c cdtext.c \
+ 		cdr_drv.c \
+-		drv_philips.c drv_sony.c drv_jvc.c drv_7501.c drv_mmc.c \
++		drv_philips.c drv_sony.c drv_jvc.c drv_7501.c drv_mmc.c plextor_auth.c \
+ 		drv_dvd.c drv_dvdplus.c \
+ 		drv_bd.c \
+ 		drv_simul.c \
+@@ -43,7 +43,7 @@ CFILES=		cdrecord.c \
+ 		scsilog.c \
+ 		misc.c crc16.c xio.c priv.c
+ HFILES=		cdrecord.h iso9660.h auheader.h cdtext.h \
+-		crc16.h movesect.h mmcvendor.h scsi_scan.h \
++		crc16.h movesect.h mmcvendor.h plextor_auth.h scsi_scan.h \
+ 		scsimmc.h \
+ 		scsilog.h adip.h \
+ 		xio.h \
+diff --git a/cdrecord/drv_mmc.c b/cdrecord/drv_mmc.c
+index 3c6aa1c..5ec29c2 100644
+--- a/cdrecord/drv_mmc.c
++++ b/cdrecord/drv_mmc.c
+@@ -52,6 +52,7 @@ static	UConst char sccsid[] =
+ #include "scsimmc.h"
+ #include "mmcvendor.h"
+ #include "cdrecord.h"
++#include "plextor_auth.h"
+ 
+ extern	char	*driveropts;
+ 
+@@ -114,10 +115,12 @@ LOCAL	void	fillcue			__PR((struct mmc_cue *cp, int ca, int tno, int idx, int dat
+ LOCAL	int	send_cue_mmc		__PR((SCSI *scgp, cdr_t *dp, track_t *trackp));
+ LOCAL int	stats_mmc		__PR((SCSI *scgp, cdr_t *dp));
+ LOCAL BOOL	mmc_isplextor		__PR((SCSI *scgp));
++LOCAL BOOL	mmc_plextor_needs_auth	__PR((SCSI *scgp));
+ LOCAL BOOL	mmc_isyamaha		__PR((SCSI *scgp));
+ LOCAL void	do_varirec_plextor	__PR((SCSI *scgp));
+ LOCAL int	do_gigarec_plextor	__PR((SCSI *scgp));
+ LOCAL int	drivemode_plextor	__PR((SCSI *scgp, caddr_t bp, int cnt, int modecode, void *modeval));
++LOCAL int	drivemode_plextor_raw	__PR((SCSI *scgp, caddr_t bp, int cnt, int modecode, void *modeval));
+ LOCAL int	drivemode2_plextor	__PR((SCSI *scgp, caddr_t bp, int cnt, int modecode, void *modeval));
+ LOCAL int	check_varirec_plextor	__PR((SCSI *scgp));
+ LOCAL int	check_gigarec_plextor	__PR((SCSI *scgp));
+@@ -136,6 +139,7 @@ LOCAL int	plextor_enable		__PR((SCSI *scgp));
+ LOCAL int	plextor_disable		__PR((SCSI *scgp));
+ LOCAL int	plextor_getauth		__PR((SCSI *scgp, void *dp, int cnt));
+ LOCAL int	plextor_setauth		__PR((SCSI *scgp, void *dp, int cnt));
++LOCAL int	plextor_auth_begin	__PR((SCSI *scgp));
+ LOCAL int	set_audiomaster_yamaha	__PR((SCSI *scgp, cdr_t *dp, BOOL keep_mode));
+ 
+ EXPORT struct ricoh_mode_page_30 * get_justlink_ricoh	__PR((SCSI *scgp, Uchar *mode));
+@@ -825,7 +829,8 @@ attach_mmc(scgp, dp)
+ 		if (check_varirec_plextor(scgp) >= 0)
+ 			dp->cdr_flags |= CDR_VARIREC;
+ 
+-		if (check_gigarec_plextor(scgp) < 0 && p == NULL)
++		if (check_gigarec_plextor(scgp) < 0 && p == NULL &&
++			    !mmc_plextor_needs_auth(scgp))
+ 			plextor_enable(scgp);
+ 
+ 		if (check_gigarec_plextor(scgp) >= 0)
+@@ -2869,6 +2874,28 @@ mmc_isplextor(scgp)
+ 	return (FALSE);
+ }
+ 
++LOCAL BOOL
++mmc_plextor_needs_auth(scgp)
++	SCSI	*scgp;
++{
++	struct scsi_inquiry *ip;
++
++	if (!mmc_isplextor(scgp) || scgp->inq == NULL)
++		return (FALSE);
++	ip = scgp->inq;
++
++	/*
++	 * The late genuine Plextor generation protects vendor E9 feature
++	 * commands with a D4/D5 challenge-response exchange.
++	 */
++	if (strncmp(ip->inq_prod_ident, "CD-R   PREMIUM2", 15) == 0 ||
++	    strncmp(ip->inq_prod_ident, "DVDR   PX-755", 13) == 0 ||
++	    strncmp(ip->inq_prod_ident, "DVDR   PX-760", 13) == 0)
++		return (TRUE);
++
++	return (FALSE);
++}
++
+ LOCAL BOOL
+ mmc_isyamaha(scgp)
+ 	SCSI	*scgp;
+@@ -2965,6 +2992,33 @@ drivemode_plextor(scgp, bp, cnt, modecode, modeval)
+ 	int	cnt;
+ 	int	modecode;
+ 	void	*modeval;
++{
++	int	ret;
++	int	eret;
++
++	if (!mmc_plextor_needs_auth(scgp))
++		return (drivemode_plextor_raw(scgp, bp, cnt, modecode, modeval));
++
++	if (plextor_auth_begin(scgp) < 0)
++		return (-1);
++
++	ret = drivemode_plextor_raw(scgp, bp, cnt, modecode, modeval);
++	eret = plextor_disable(scgp);
++
++	if (ret < 0)
++		return (ret);
++	if (eret < 0)
++		return (-1);
++	return (ret);
++}
++
++LOCAL int
++drivemode_plextor_raw(scgp, bp, cnt, modecode, modeval)
++	SCSI	*scgp;
++	caddr_t	bp;
++	int	cnt;
++	int	modecode;
++	void	*modeval;
+ {
+ 	register struct	scg_cmd	*scmd = scgp->scmd;
+ 
+@@ -3527,6 +3581,34 @@ bpc_plextor(scgp, mode, bpp)
+ 	return (0);
+ }
+ 
++LOCAL int
++plextor_auth_begin(scgp)
++	SCSI	*scgp;
++{
++	Uchar	challenge[16];
++	Uchar	response[16];
++	int	ret;
++
++	/*
++	 * A previous interrupted operation may have left authentication open.
++	 * If D4 is rejected, close any stale session and retry once.
++	 */
++	ret = plextor_getauth(scgp, challenge, sizeof (challenge));
++	if (ret < 0) {
++		(void) plextor_disable(scgp);
++		ret = plextor_getauth(scgp, challenge, sizeof (challenge));
++	}
++	if (ret < 0)
++		return (ret);
++
++	plextor_auth_response(challenge, response);
++	ret = plextor_setauth(scgp, response, sizeof (response));
++	if (ret < 0)
++		(void) plextor_disable(scgp);
++
++	return (ret);
++}
++
+ LOCAL int
+ plextor_enable(scgp)
+ 	SCSI	*scgp;
+diff --git a/cdrecord/plextor_auth.c b/cdrecord/plextor_auth.c
+new file mode 100644
+index 0000000..7f76975
+--- /dev/null
++++ b/cdrecord/plextor_auth.c
+@@ -0,0 +1,469 @@
++/*
++ * Minimal MD5 + Blowfish implementation for the Plextor challenge-response
++ * protocol used by the Premium2, PX-755 and PX-760.
++ *
++ * Written for QPxTool and adapted for cdrecord.  This file is dedicated to
++ * the public domain.  To the extent that a public-domain dedication is not
++ * effective in a particular jurisdiction, permission is granted to anyone to
++ * use, copy, modify, publish, distribute, sublicense, and/or sell this software
++ * for any purpose, with or without fee and with or without attribution.
++ *
++ * This is intentionally not a general crypto library.  It implements only:
++ *   - MD5 of one 16-byte message (the only message size used here)
++ *   - Blowfish key expansion for a 16-byte key
++ *   - Blowfish ECB decryption of an 8-byte block
++ */
++#include <schily/mconfig.h>
++#include <schily/standard.h>
++#include <schily/utypes.h>
++#include <schily/string.h>
++
++#include "plextor_auth.h"
++
++LOCAL UInt32_t
++plextor_auth_rotl32(x, n)
++	UInt32_t x;
++	unsigned n;
++{
++    return (x << n) | (x >> (32 - n));
++}
++
++LOCAL UInt32_t
++plextor_auth_load_le32(p)
++	const Uchar *p;
++{
++    return (UInt32_t)p[0] |
++           ((UInt32_t)p[1] << 8) |
++           ((UInt32_t)p[2] << 16) |
++           ((UInt32_t)p[3] << 24);
++}
++
++LOCAL void
++plextor_auth_store_le32(p, x)
++	Uchar *p;
++	UInt32_t x;
++{
++    p[0] = (Uchar)x;
++    p[1] = (Uchar)(x >> 8);
++    p[2] = (Uchar)(x >> 16);
++    p[3] = (Uchar)(x >> 24);
++}
++
++/* MD5 for exactly one 16-byte input. */
++LOCAL void
++plextor_auth_md5_16(in, out)
++	const Uchar *in;
++	Uchar *out;
++{
++    static const UInt32_t k[64] = {
++        ((UInt32_t)0xd76aa478UL), ((UInt32_t)0xe8c7b756UL), ((UInt32_t)0x242070dbUL), ((UInt32_t)0xc1bdceeeUL),
++        ((UInt32_t)0xf57c0fafUL), ((UInt32_t)0x4787c62aUL), ((UInt32_t)0xa8304613UL), ((UInt32_t)0xfd469501UL),
++        ((UInt32_t)0x698098d8UL), ((UInt32_t)0x8b44f7afUL), ((UInt32_t)0xffff5bb1UL), ((UInt32_t)0x895cd7beUL),
++        ((UInt32_t)0x6b901122UL), ((UInt32_t)0xfd987193UL), ((UInt32_t)0xa679438eUL), ((UInt32_t)0x49b40821UL),
++        ((UInt32_t)0xf61e2562UL), ((UInt32_t)0xc040b340UL), ((UInt32_t)0x265e5a51UL), ((UInt32_t)0xe9b6c7aaUL),
++        ((UInt32_t)0xd62f105dUL), ((UInt32_t)0x02441453UL), ((UInt32_t)0xd8a1e681UL), ((UInt32_t)0xe7d3fbc8UL),
++        ((UInt32_t)0x21e1cde6UL), ((UInt32_t)0xc33707d6UL), ((UInt32_t)0xf4d50d87UL), ((UInt32_t)0x455a14edUL),
++        ((UInt32_t)0xa9e3e905UL), ((UInt32_t)0xfcefa3f8UL), ((UInt32_t)0x676f02d9UL), ((UInt32_t)0x8d2a4c8aUL),
++        ((UInt32_t)0xfffa3942UL), ((UInt32_t)0x8771f681UL), ((UInt32_t)0x6d9d6122UL), ((UInt32_t)0xfde5380cUL),
++        ((UInt32_t)0xa4beea44UL), ((UInt32_t)0x4bdecfa9UL), ((UInt32_t)0xf6bb4b60UL), ((UInt32_t)0xbebfbc70UL),
++        ((UInt32_t)0x289b7ec6UL), ((UInt32_t)0xeaa127faUL), ((UInt32_t)0xd4ef3085UL), ((UInt32_t)0x04881d05UL),
++        ((UInt32_t)0xd9d4d039UL), ((UInt32_t)0xe6db99e5UL), ((UInt32_t)0x1fa27cf8UL), ((UInt32_t)0xc4ac5665UL),
++        ((UInt32_t)0xf4292244UL), ((UInt32_t)0x432aff97UL), ((UInt32_t)0xab9423a7UL), ((UInt32_t)0xfc93a039UL),
++        ((UInt32_t)0x655b59c3UL), ((UInt32_t)0x8f0ccc92UL), ((UInt32_t)0xffeff47dUL), ((UInt32_t)0x85845dd1UL),
++        ((UInt32_t)0x6fa87e4fUL), ((UInt32_t)0xfe2ce6e0UL), ((UInt32_t)0xa3014314UL), ((UInt32_t)0x4e0811a1UL),
++        ((UInt32_t)0xf7537e82UL), ((UInt32_t)0xbd3af235UL), ((UInt32_t)0x2ad7d2bbUL), ((UInt32_t)0xeb86d391UL)
++    };
++    static const Uchar r[64] = {
++         7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
++         5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
++         4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
++         6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21
++    };
++    Uchar block[64];
++    UInt32_t m[16];
++    UInt32_t a = ((UInt32_t)0x67452301UL);
++    UInt32_t b = ((UInt32_t)0xefcdab89UL);
++    UInt32_t c = ((UInt32_t)0x98badcfeUL);
++    UInt32_t d = ((UInt32_t)0x10325476UL);
++    UInt32_t aa = a, bb = b, cc = c, dd = d;
++    UInt32_t f, g, t;
++    unsigned i;
++
++    memset(block, 0, sizeof(block));
++    memcpy(block, in, 16);
++    block[16] = 0x80;
++    block[56] = 0x80; /* 16 bytes == 128 bits, little-endian */
++    for (i = 0; i < 16; ++i)
++        m[i] = plextor_auth_load_le32(block + i * 4);
++
++    for (i = 0; i < 64; ++i) {
++        if (i < 16) {
++            f = (b & c) | (~b & d);
++            g = i;
++        } else if (i < 32) {
++            f = (d & b) | (~d & c);
++            g = (5 * i + 1) & 15;
++        } else if (i < 48) {
++            f = b ^ c ^ d;
++            g = (3 * i + 5) & 15;
++        } else {
++            f = c ^ (b | ~d);
++            g = (7 * i) & 15;
++        }
++        t = d;
++        d = c;
++        c = b;
++        b += plextor_auth_rotl32(a + f + k[i] + m[g], r[i]);
++        a = t;
++    }
++
++    aa += a; bb += b; cc += c; dd += d;
++    plextor_auth_store_le32(out + 0, aa);
++    plextor_auth_store_le32(out + 4, bb);
++    plextor_auth_store_le32(out + 8, cc);
++    plextor_auth_store_le32(out + 12, dd);
++}
++
++typedef struct plextor_auth_blowfish_ctx {
++    UInt32_t p[18];
++    UInt32_t s[4][256];
++} plextor_auth_blowfish_ctx;
++
++LOCAL const UInt32_t plextor_auth_bf_init_p[18] = {
++    ((UInt32_t)0x243f6a88UL), ((UInt32_t)0x85a308d3UL), ((UInt32_t)0x13198a2eUL), ((UInt32_t)0x03707344UL), ((UInt32_t)0xa4093822UL), ((UInt32_t)0x299f31d0UL),
++    ((UInt32_t)0x082efa98UL), ((UInt32_t)0xec4e6c89UL), ((UInt32_t)0x452821e6UL), ((UInt32_t)0x38d01377UL), ((UInt32_t)0xbe5466cfUL), ((UInt32_t)0x34e90c6cUL),
++    ((UInt32_t)0xc0ac29b7UL), ((UInt32_t)0xc97c50ddUL), ((UInt32_t)0x3f84d5b5UL), ((UInt32_t)0xb5470917UL), ((UInt32_t)0x9216d5d9UL), ((UInt32_t)0x8979fb1bUL)
++};
++
++LOCAL const UInt32_t plextor_auth_bf_init_s[4][256] = {
++    {
++        ((UInt32_t)0xd1310ba6UL), ((UInt32_t)0x98dfb5acUL), ((UInt32_t)0x2ffd72dbUL), ((UInt32_t)0xd01adfb7UL), ((UInt32_t)0xb8e1afedUL), ((UInt32_t)0x6a267e96UL),
++        ((UInt32_t)0xba7c9045UL), ((UInt32_t)0xf12c7f99UL), ((UInt32_t)0x24a19947UL), ((UInt32_t)0xb3916cf7UL), ((UInt32_t)0x0801f2e2UL), ((UInt32_t)0x858efc16UL),
++        ((UInt32_t)0x636920d8UL), ((UInt32_t)0x71574e69UL), ((UInt32_t)0xa458fea3UL), ((UInt32_t)0xf4933d7eUL), ((UInt32_t)0x0d95748fUL), ((UInt32_t)0x728eb658UL),
++        ((UInt32_t)0x718bcd58UL), ((UInt32_t)0x82154aeeUL), ((UInt32_t)0x7b54a41dUL), ((UInt32_t)0xc25a59b5UL), ((UInt32_t)0x9c30d539UL), ((UInt32_t)0x2af26013UL),
++        ((UInt32_t)0xc5d1b023UL), ((UInt32_t)0x286085f0UL), ((UInt32_t)0xca417918UL), ((UInt32_t)0xb8db38efUL), ((UInt32_t)0x8e79dcb0UL), ((UInt32_t)0x603a180eUL),
++        ((UInt32_t)0x6c9e0e8bUL), ((UInt32_t)0xb01e8a3eUL), ((UInt32_t)0xd71577c1UL), ((UInt32_t)0xbd314b27UL), ((UInt32_t)0x78af2fdaUL), ((UInt32_t)0x55605c60UL),
++        ((UInt32_t)0xe65525f3UL), ((UInt32_t)0xaa55ab94UL), ((UInt32_t)0x57489862UL), ((UInt32_t)0x63e81440UL), ((UInt32_t)0x55ca396aUL), ((UInt32_t)0x2aab10b6UL),
++        ((UInt32_t)0xb4cc5c34UL), ((UInt32_t)0x1141e8ceUL), ((UInt32_t)0xa15486afUL), ((UInt32_t)0x7c72e993UL), ((UInt32_t)0xb3ee1411UL), ((UInt32_t)0x636fbc2aUL),
++        ((UInt32_t)0x2ba9c55dUL), ((UInt32_t)0x741831f6UL), ((UInt32_t)0xce5c3e16UL), ((UInt32_t)0x9b87931eUL), ((UInt32_t)0xafd6ba33UL), ((UInt32_t)0x6c24cf5cUL),
++        ((UInt32_t)0x7a325381UL), ((UInt32_t)0x28958677UL), ((UInt32_t)0x3b8f4898UL), ((UInt32_t)0x6b4bb9afUL), ((UInt32_t)0xc4bfe81bUL), ((UInt32_t)0x66282193UL),
++        ((UInt32_t)0x61d809ccUL), ((UInt32_t)0xfb21a991UL), ((UInt32_t)0x487cac60UL), ((UInt32_t)0x5dec8032UL), ((UInt32_t)0xef845d5dUL), ((UInt32_t)0xe98575b1UL),
++        ((UInt32_t)0xdc262302UL), ((UInt32_t)0xeb651b88UL), ((UInt32_t)0x23893e81UL), ((UInt32_t)0xd396acc5UL), ((UInt32_t)0x0f6d6ff3UL), ((UInt32_t)0x83f44239UL),
++        ((UInt32_t)0x2e0b4482UL), ((UInt32_t)0xa4842004UL), ((UInt32_t)0x69c8f04aUL), ((UInt32_t)0x9e1f9b5eUL), ((UInt32_t)0x21c66842UL), ((UInt32_t)0xf6e96c9aUL),
++        ((UInt32_t)0x670c9c61UL), ((UInt32_t)0xabd388f0UL), ((UInt32_t)0x6a51a0d2UL), ((UInt32_t)0xd8542f68UL), ((UInt32_t)0x960fa728UL), ((UInt32_t)0xab5133a3UL),
++        ((UInt32_t)0x6eef0b6cUL), ((UInt32_t)0x137a3be4UL), ((UInt32_t)0xba3bf050UL), ((UInt32_t)0x7efb2a98UL), ((UInt32_t)0xa1f1651dUL), ((UInt32_t)0x39af0176UL),
++        ((UInt32_t)0x66ca593eUL), ((UInt32_t)0x82430e88UL), ((UInt32_t)0x8cee8619UL), ((UInt32_t)0x456f9fb4UL), ((UInt32_t)0x7d84a5c3UL), ((UInt32_t)0x3b8b5ebeUL),
++        ((UInt32_t)0xe06f75d8UL), ((UInt32_t)0x85c12073UL), ((UInt32_t)0x401a449fUL), ((UInt32_t)0x56c16aa6UL), ((UInt32_t)0x4ed3aa62UL), ((UInt32_t)0x363f7706UL),
++        ((UInt32_t)0x1bfedf72UL), ((UInt32_t)0x429b023dUL), ((UInt32_t)0x37d0d724UL), ((UInt32_t)0xd00a1248UL), ((UInt32_t)0xdb0fead3UL), ((UInt32_t)0x49f1c09bUL),
++        ((UInt32_t)0x075372c9UL), ((UInt32_t)0x80991b7bUL), ((UInt32_t)0x25d479d8UL), ((UInt32_t)0xf6e8def7UL), ((UInt32_t)0xe3fe501aUL), ((UInt32_t)0xb6794c3bUL),
++        ((UInt32_t)0x976ce0bdUL), ((UInt32_t)0x04c006baUL), ((UInt32_t)0xc1a94fb6UL), ((UInt32_t)0x409f60c4UL), ((UInt32_t)0x5e5c9ec2UL), ((UInt32_t)0x196a2463UL),
++        ((UInt32_t)0x68fb6fafUL), ((UInt32_t)0x3e6c53b5UL), ((UInt32_t)0x1339b2ebUL), ((UInt32_t)0x3b52ec6fUL), ((UInt32_t)0x6dfc511fUL), ((UInt32_t)0x9b30952cUL),
++        ((UInt32_t)0xcc814544UL), ((UInt32_t)0xaf5ebd09UL), ((UInt32_t)0xbee3d004UL), ((UInt32_t)0xde334afdUL), ((UInt32_t)0x660f2807UL), ((UInt32_t)0x192e4bb3UL),
++        ((UInt32_t)0xc0cba857UL), ((UInt32_t)0x45c8740fUL), ((UInt32_t)0xd20b5f39UL), ((UInt32_t)0xb9d3fbdbUL), ((UInt32_t)0x5579c0bdUL), ((UInt32_t)0x1a60320aUL),
++        ((UInt32_t)0xd6a100c6UL), ((UInt32_t)0x402c7279UL), ((UInt32_t)0x679f25feUL), ((UInt32_t)0xfb1fa3ccUL), ((UInt32_t)0x8ea5e9f8UL), ((UInt32_t)0xdb3222f8UL),
++        ((UInt32_t)0x3c7516dfUL), ((UInt32_t)0xfd616b15UL), ((UInt32_t)0x2f501ec8UL), ((UInt32_t)0xad0552abUL), ((UInt32_t)0x323db5faUL), ((UInt32_t)0xfd238760UL),
++        ((UInt32_t)0x53317b48UL), ((UInt32_t)0x3e00df82UL), ((UInt32_t)0x9e5c57bbUL), ((UInt32_t)0xca6f8ca0UL), ((UInt32_t)0x1a87562eUL), ((UInt32_t)0xdf1769dbUL),
++        ((UInt32_t)0xd542a8f6UL), ((UInt32_t)0x287effc3UL), ((UInt32_t)0xac6732c6UL), ((UInt32_t)0x8c4f5573UL), ((UInt32_t)0x695b27b0UL), ((UInt32_t)0xbbca58c8UL),
++        ((UInt32_t)0xe1ffa35dUL), ((UInt32_t)0xb8f011a0UL), ((UInt32_t)0x10fa3d98UL), ((UInt32_t)0xfd2183b8UL), ((UInt32_t)0x4afcb56cUL), ((UInt32_t)0x2dd1d35bUL),
++        ((UInt32_t)0x9a53e479UL), ((UInt32_t)0xb6f84565UL), ((UInt32_t)0xd28e49bcUL), ((UInt32_t)0x4bfb9790UL), ((UInt32_t)0xe1ddf2daUL), ((UInt32_t)0xa4cb7e33UL),
++        ((UInt32_t)0x62fb1341UL), ((UInt32_t)0xcee4c6e8UL), ((UInt32_t)0xef20cadaUL), ((UInt32_t)0x36774c01UL), ((UInt32_t)0xd07e9efeUL), ((UInt32_t)0x2bf11fb4UL),
++        ((UInt32_t)0x95dbda4dUL), ((UInt32_t)0xae909198UL), ((UInt32_t)0xeaad8e71UL), ((UInt32_t)0x6b93d5a0UL), ((UInt32_t)0xd08ed1d0UL), ((UInt32_t)0xafc725e0UL),
++        ((UInt32_t)0x8e3c5b2fUL), ((UInt32_t)0x8e7594b7UL), ((UInt32_t)0x8ff6e2fbUL), ((UInt32_t)0xf2122b64UL), ((UInt32_t)0x8888b812UL), ((UInt32_t)0x900df01cUL),
++        ((UInt32_t)0x4fad5ea0UL), ((UInt32_t)0x688fc31cUL), ((UInt32_t)0xd1cff191UL), ((UInt32_t)0xb3a8c1adUL), ((UInt32_t)0x2f2f2218UL), ((UInt32_t)0xbe0e1777UL),
++        ((UInt32_t)0xea752dfeUL), ((UInt32_t)0x8b021fa1UL), ((UInt32_t)0xe5a0cc0fUL), ((UInt32_t)0xb56f74e8UL), ((UInt32_t)0x18acf3d6UL), ((UInt32_t)0xce89e299UL),
++        ((UInt32_t)0xb4a84fe0UL), ((UInt32_t)0xfd13e0b7UL), ((UInt32_t)0x7cc43b81UL), ((UInt32_t)0xd2ada8d9UL), ((UInt32_t)0x165fa266UL), ((UInt32_t)0x80957705UL),
++        ((UInt32_t)0x93cc7314UL), ((UInt32_t)0x211a1477UL), ((UInt32_t)0xe6ad2065UL), ((UInt32_t)0x77b5fa86UL), ((UInt32_t)0xc75442f5UL), ((UInt32_t)0xfb9d35cfUL),
++        ((UInt32_t)0xebcdaf0cUL), ((UInt32_t)0x7b3e89a0UL), ((UInt32_t)0xd6411bd3UL), ((UInt32_t)0xae1e7e49UL), ((UInt32_t)0x00250e2dUL), ((UInt32_t)0x2071b35eUL),
++        ((UInt32_t)0x226800bbUL), ((UInt32_t)0x57b8e0afUL), ((UInt32_t)0x2464369bUL), ((UInt32_t)0xf009b91eUL), ((UInt32_t)0x5563911dUL), ((UInt32_t)0x59dfa6aaUL),
++        ((UInt32_t)0x78c14389UL), ((UInt32_t)0xd95a537fUL), ((UInt32_t)0x207d5ba2UL), ((UInt32_t)0x02e5b9c5UL), ((UInt32_t)0x83260376UL), ((UInt32_t)0x6295cfa9UL),
++        ((UInt32_t)0x11c81968UL), ((UInt32_t)0x4e734a41UL), ((UInt32_t)0xb3472dcaUL), ((UInt32_t)0x7b14a94aUL), ((UInt32_t)0x1b510052UL), ((UInt32_t)0x9a532915UL),
++        ((UInt32_t)0xd60f573fUL), ((UInt32_t)0xbc9bc6e4UL), ((UInt32_t)0x2b60a476UL), ((UInt32_t)0x81e67400UL), ((UInt32_t)0x08ba6fb5UL), ((UInt32_t)0x571be91fUL),
++        ((UInt32_t)0xf296ec6bUL), ((UInt32_t)0x2a0dd915UL), ((UInt32_t)0xb6636521UL), ((UInt32_t)0xe7b9f9b6UL), ((UInt32_t)0xff34052eUL), ((UInt32_t)0xc5855664UL),
++        ((UInt32_t)0x53b02d5dUL), ((UInt32_t)0xa99f8fa1UL), ((UInt32_t)0x08ba4799UL), ((UInt32_t)0x6e85076aUL)
++    },
++    {
++        ((UInt32_t)0x4b7a70e9UL), ((UInt32_t)0xb5b32944UL), ((UInt32_t)0xdb75092eUL), ((UInt32_t)0xc4192623UL), ((UInt32_t)0xad6ea6b0UL), ((UInt32_t)0x49a7df7dUL),
++        ((UInt32_t)0x9cee60b8UL), ((UInt32_t)0x8fedb266UL), ((UInt32_t)0xecaa8c71UL), ((UInt32_t)0x699a17ffUL), ((UInt32_t)0x5664526cUL), ((UInt32_t)0xc2b19ee1UL),
++        ((UInt32_t)0x193602a5UL), ((UInt32_t)0x75094c29UL), ((UInt32_t)0xa0591340UL), ((UInt32_t)0xe4183a3eUL), ((UInt32_t)0x3f54989aUL), ((UInt32_t)0x5b429d65UL),
++        ((UInt32_t)0x6b8fe4d6UL), ((UInt32_t)0x99f73fd6UL), ((UInt32_t)0xa1d29c07UL), ((UInt32_t)0xefe830f5UL), ((UInt32_t)0x4d2d38e6UL), ((UInt32_t)0xf0255dc1UL),
++        ((UInt32_t)0x4cdd2086UL), ((UInt32_t)0x8470eb26UL), ((UInt32_t)0x6382e9c6UL), ((UInt32_t)0x021ecc5eUL), ((UInt32_t)0x09686b3fUL), ((UInt32_t)0x3ebaefc9UL),
++        ((UInt32_t)0x3c971814UL), ((UInt32_t)0x6b6a70a1UL), ((UInt32_t)0x687f3584UL), ((UInt32_t)0x52a0e286UL), ((UInt32_t)0xb79c5305UL), ((UInt32_t)0xaa500737UL),
++        ((UInt32_t)0x3e07841cUL), ((UInt32_t)0x7fdeae5cUL), ((UInt32_t)0x8e7d44ecUL), ((UInt32_t)0x5716f2b8UL), ((UInt32_t)0xb03ada37UL), ((UInt32_t)0xf0500c0dUL),
++        ((UInt32_t)0xf01c1f04UL), ((UInt32_t)0x0200b3ffUL), ((UInt32_t)0xae0cf51aUL), ((UInt32_t)0x3cb574b2UL), ((UInt32_t)0x25837a58UL), ((UInt32_t)0xdc0921bdUL),
++        ((UInt32_t)0xd19113f9UL), ((UInt32_t)0x7ca92ff6UL), ((UInt32_t)0x94324773UL), ((UInt32_t)0x22f54701UL), ((UInt32_t)0x3ae5e581UL), ((UInt32_t)0x37c2dadcUL),
++        ((UInt32_t)0xc8b57634UL), ((UInt32_t)0x9af3dda7UL), ((UInt32_t)0xa9446146UL), ((UInt32_t)0x0fd0030eUL), ((UInt32_t)0xecc8c73eUL), ((UInt32_t)0xa4751e41UL),
++        ((UInt32_t)0xe238cd99UL), ((UInt32_t)0x3bea0e2fUL), ((UInt32_t)0x3280bba1UL), ((UInt32_t)0x183eb331UL), ((UInt32_t)0x4e548b38UL), ((UInt32_t)0x4f6db908UL),
++        ((UInt32_t)0x6f420d03UL), ((UInt32_t)0xf60a04bfUL), ((UInt32_t)0x2cb81290UL), ((UInt32_t)0x24977c79UL), ((UInt32_t)0x5679b072UL), ((UInt32_t)0xbcaf89afUL),
++        ((UInt32_t)0xde9a771fUL), ((UInt32_t)0xd9930810UL), ((UInt32_t)0xb38bae12UL), ((UInt32_t)0xdccf3f2eUL), ((UInt32_t)0x5512721fUL), ((UInt32_t)0x2e6b7124UL),
++        ((UInt32_t)0x501adde6UL), ((UInt32_t)0x9f84cd87UL), ((UInt32_t)0x7a584718UL), ((UInt32_t)0x7408da17UL), ((UInt32_t)0xbc9f9abcUL), ((UInt32_t)0xe94b7d8cUL),
++        ((UInt32_t)0xec7aec3aUL), ((UInt32_t)0xdb851dfaUL), ((UInt32_t)0x63094366UL), ((UInt32_t)0xc464c3d2UL), ((UInt32_t)0xef1c1847UL), ((UInt32_t)0x3215d908UL),
++        ((UInt32_t)0xdd433b37UL), ((UInt32_t)0x24c2ba16UL), ((UInt32_t)0x12a14d43UL), ((UInt32_t)0x2a65c451UL), ((UInt32_t)0x50940002UL), ((UInt32_t)0x133ae4ddUL),
++        ((UInt32_t)0x71dff89eUL), ((UInt32_t)0x10314e55UL), ((UInt32_t)0x81ac77d6UL), ((UInt32_t)0x5f11199bUL), ((UInt32_t)0x043556f1UL), ((UInt32_t)0xd7a3c76bUL),
++        ((UInt32_t)0x3c11183bUL), ((UInt32_t)0x5924a509UL), ((UInt32_t)0xf28fe6edUL), ((UInt32_t)0x97f1fbfaUL), ((UInt32_t)0x9ebabf2cUL), ((UInt32_t)0x1e153c6eUL),
++        ((UInt32_t)0x86e34570UL), ((UInt32_t)0xeae96fb1UL), ((UInt32_t)0x860e5e0aUL), ((UInt32_t)0x5a3e2ab3UL), ((UInt32_t)0x771fe71cUL), ((UInt32_t)0x4e3d06faUL),
++        ((UInt32_t)0x2965dcb9UL), ((UInt32_t)0x99e71d0fUL), ((UInt32_t)0x803e89d6UL), ((UInt32_t)0x5266c825UL), ((UInt32_t)0x2e4cc978UL), ((UInt32_t)0x9c10b36aUL),
++        ((UInt32_t)0xc6150ebaUL), ((UInt32_t)0x94e2ea78UL), ((UInt32_t)0xa5fc3c53UL), ((UInt32_t)0x1e0a2df4UL), ((UInt32_t)0xf2f74ea7UL), ((UInt32_t)0x361d2b3dUL),
++        ((UInt32_t)0x1939260fUL), ((UInt32_t)0x19c27960UL), ((UInt32_t)0x5223a708UL), ((UInt32_t)0xf71312b6UL), ((UInt32_t)0xebadfe6eUL), ((UInt32_t)0xeac31f66UL),
++        ((UInt32_t)0xe3bc4595UL), ((UInt32_t)0xa67bc883UL), ((UInt32_t)0xb17f37d1UL), ((UInt32_t)0x018cff28UL), ((UInt32_t)0xc332ddefUL), ((UInt32_t)0xbe6c5aa5UL),
++        ((UInt32_t)0x65582185UL), ((UInt32_t)0x68ab9802UL), ((UInt32_t)0xeecea50fUL), ((UInt32_t)0xdb2f953bUL), ((UInt32_t)0x2aef7dadUL), ((UInt32_t)0x5b6e2f84UL),
++        ((UInt32_t)0x1521b628UL), ((UInt32_t)0x29076170UL), ((UInt32_t)0xecdd4775UL), ((UInt32_t)0x619f1510UL), ((UInt32_t)0x13cca830UL), ((UInt32_t)0xeb61bd96UL),
++        ((UInt32_t)0x0334fe1eUL), ((UInt32_t)0xaa0363cfUL), ((UInt32_t)0xb5735c90UL), ((UInt32_t)0x4c70a239UL), ((UInt32_t)0xd59e9e0bUL), ((UInt32_t)0xcbaade14UL),
++        ((UInt32_t)0xeecc86bcUL), ((UInt32_t)0x60622ca7UL), ((UInt32_t)0x9cab5cabUL), ((UInt32_t)0xb2f3846eUL), ((UInt32_t)0x648b1eafUL), ((UInt32_t)0x19bdf0caUL),
++        ((UInt32_t)0xa02369b9UL), ((UInt32_t)0x655abb50UL), ((UInt32_t)0x40685a32UL), ((UInt32_t)0x3c2ab4b3UL), ((UInt32_t)0x319ee9d5UL), ((UInt32_t)0xc021b8f7UL),
++        ((UInt32_t)0x9b540b19UL), ((UInt32_t)0x875fa099UL), ((UInt32_t)0x95f7997eUL), ((UInt32_t)0x623d7da8UL), ((UInt32_t)0xf837889aUL), ((UInt32_t)0x97e32d77UL),
++        ((UInt32_t)0x11ed935fUL), ((UInt32_t)0x16681281UL), ((UInt32_t)0x0e358829UL), ((UInt32_t)0xc7e61fd6UL), ((UInt32_t)0x96dedfa1UL), ((UInt32_t)0x7858ba99UL),
++        ((UInt32_t)0x57f584a5UL), ((UInt32_t)0x1b227263UL), ((UInt32_t)0x9b83c3ffUL), ((UInt32_t)0x1ac24696UL), ((UInt32_t)0xcdb30aebUL), ((UInt32_t)0x532e3054UL),
++        ((UInt32_t)0x8fd948e4UL), ((UInt32_t)0x6dbc3128UL), ((UInt32_t)0x58ebf2efUL), ((UInt32_t)0x34c6ffeaUL), ((UInt32_t)0xfe28ed61UL), ((UInt32_t)0xee7c3c73UL),
++        ((UInt32_t)0x5d4a14d9UL), ((UInt32_t)0xe864b7e3UL), ((UInt32_t)0x42105d14UL), ((UInt32_t)0x203e13e0UL), ((UInt32_t)0x45eee2b6UL), ((UInt32_t)0xa3aaabeaUL),
++        ((UInt32_t)0xdb6c4f15UL), ((UInt32_t)0xfacb4fd0UL), ((UInt32_t)0xc742f442UL), ((UInt32_t)0xef6abbb5UL), ((UInt32_t)0x654f3b1dUL), ((UInt32_t)0x41cd2105UL),
++        ((UInt32_t)0xd81e799eUL), ((UInt32_t)0x86854dc7UL), ((UInt32_t)0xe44b476aUL), ((UInt32_t)0x3d816250UL), ((UInt32_t)0xcf62a1f2UL), ((UInt32_t)0x5b8d2646UL),
++        ((UInt32_t)0xfc8883a0UL), ((UInt32_t)0xc1c7b6a3UL), ((UInt32_t)0x7f1524c3UL), ((UInt32_t)0x69cb7492UL), ((UInt32_t)0x47848a0bUL), ((UInt32_t)0x5692b285UL),
++        ((UInt32_t)0x095bbf00UL), ((UInt32_t)0xad19489dUL), ((UInt32_t)0x1462b174UL), ((UInt32_t)0x23820e00UL), ((UInt32_t)0x58428d2aUL), ((UInt32_t)0x0c55f5eaUL),
++        ((UInt32_t)0x1dadf43eUL), ((UInt32_t)0x233f7061UL), ((UInt32_t)0x3372f092UL), ((UInt32_t)0x8d937e41UL), ((UInt32_t)0xd65fecf1UL), ((UInt32_t)0x6c223bdbUL),
++        ((UInt32_t)0x7cde3759UL), ((UInt32_t)0xcbee7460UL), ((UInt32_t)0x4085f2a7UL), ((UInt32_t)0xce77326eUL), ((UInt32_t)0xa6078084UL), ((UInt32_t)0x19f8509eUL),
++        ((UInt32_t)0xe8efd855UL), ((UInt32_t)0x61d99735UL), ((UInt32_t)0xa969a7aaUL), ((UInt32_t)0xc50c06c2UL), ((UInt32_t)0x5a04abfcUL), ((UInt32_t)0x800bcadcUL),
++        ((UInt32_t)0x9e447a2eUL), ((UInt32_t)0xc3453484UL), ((UInt32_t)0xfdd56705UL), ((UInt32_t)0x0e1e9ec9UL), ((UInt32_t)0xdb73dbd3UL), ((UInt32_t)0x105588cdUL),
++        ((UInt32_t)0x675fda79UL), ((UInt32_t)0xe3674340UL), ((UInt32_t)0xc5c43465UL), ((UInt32_t)0x713e38d8UL), ((UInt32_t)0x3d28f89eUL), ((UInt32_t)0xf16dff20UL),
++        ((UInt32_t)0x153e21e7UL), ((UInt32_t)0x8fb03d4aUL), ((UInt32_t)0xe6e39f2bUL), ((UInt32_t)0xdb83adf7UL)
++    },
++    {
++        ((UInt32_t)0xe93d5a68UL), ((UInt32_t)0x948140f7UL), ((UInt32_t)0xf64c261cUL), ((UInt32_t)0x94692934UL), ((UInt32_t)0x411520f7UL), ((UInt32_t)0x7602d4f7UL),
++        ((UInt32_t)0xbcf46b2eUL), ((UInt32_t)0xd4a20068UL), ((UInt32_t)0xd4082471UL), ((UInt32_t)0x3320f46aUL), ((UInt32_t)0x43b7d4b7UL), ((UInt32_t)0x500061afUL),
++        ((UInt32_t)0x1e39f62eUL), ((UInt32_t)0x97244546UL), ((UInt32_t)0x14214f74UL), ((UInt32_t)0xbf8b8840UL), ((UInt32_t)0x4d95fc1dUL), ((UInt32_t)0x96b591afUL),
++        ((UInt32_t)0x70f4ddd3UL), ((UInt32_t)0x66a02f45UL), ((UInt32_t)0xbfbc09ecUL), ((UInt32_t)0x03bd9785UL), ((UInt32_t)0x7fac6dd0UL), ((UInt32_t)0x31cb8504UL),
++        ((UInt32_t)0x96eb27b3UL), ((UInt32_t)0x55fd3941UL), ((UInt32_t)0xda2547e6UL), ((UInt32_t)0xabca0a9aUL), ((UInt32_t)0x28507825UL), ((UInt32_t)0x530429f4UL),
++        ((UInt32_t)0x0a2c86daUL), ((UInt32_t)0xe9b66dfbUL), ((UInt32_t)0x68dc1462UL), ((UInt32_t)0xd7486900UL), ((UInt32_t)0x680ec0a4UL), ((UInt32_t)0x27a18deeUL),
++        ((UInt32_t)0x4f3ffea2UL), ((UInt32_t)0xe887ad8cUL), ((UInt32_t)0xb58ce006UL), ((UInt32_t)0x7af4d6b6UL), ((UInt32_t)0xaace1e7cUL), ((UInt32_t)0xd3375fecUL),
++        ((UInt32_t)0xce78a399UL), ((UInt32_t)0x406b2a42UL), ((UInt32_t)0x20fe9e35UL), ((UInt32_t)0xd9f385b9UL), ((UInt32_t)0xee39d7abUL), ((UInt32_t)0x3b124e8bUL),
++        ((UInt32_t)0x1dc9faf7UL), ((UInt32_t)0x4b6d1856UL), ((UInt32_t)0x26a36631UL), ((UInt32_t)0xeae397b2UL), ((UInt32_t)0x3a6efa74UL), ((UInt32_t)0xdd5b4332UL),
++        ((UInt32_t)0x6841e7f7UL), ((UInt32_t)0xca7820fbUL), ((UInt32_t)0xfb0af54eUL), ((UInt32_t)0xd8feb397UL), ((UInt32_t)0x454056acUL), ((UInt32_t)0xba489527UL),
++        ((UInt32_t)0x55533a3aUL), ((UInt32_t)0x20838d87UL), ((UInt32_t)0xfe6ba9b7UL), ((UInt32_t)0xd096954bUL), ((UInt32_t)0x55a867bcUL), ((UInt32_t)0xa1159a58UL),
++        ((UInt32_t)0xcca92963UL), ((UInt32_t)0x99e1db33UL), ((UInt32_t)0xa62a4a56UL), ((UInt32_t)0x3f3125f9UL), ((UInt32_t)0x5ef47e1cUL), ((UInt32_t)0x9029317cUL),
++        ((UInt32_t)0xfdf8e802UL), ((UInt32_t)0x04272f70UL), ((UInt32_t)0x80bb155cUL), ((UInt32_t)0x05282ce3UL), ((UInt32_t)0x95c11548UL), ((UInt32_t)0xe4c66d22UL),
++        ((UInt32_t)0x48c1133fUL), ((UInt32_t)0xc70f86dcUL), ((UInt32_t)0x07f9c9eeUL), ((UInt32_t)0x41041f0fUL), ((UInt32_t)0x404779a4UL), ((UInt32_t)0x5d886e17UL),
++        ((UInt32_t)0x325f51ebUL), ((UInt32_t)0xd59bc0d1UL), ((UInt32_t)0xf2bcc18fUL), ((UInt32_t)0x41113564UL), ((UInt32_t)0x257b7834UL), ((UInt32_t)0x602a9c60UL),
++        ((UInt32_t)0xdff8e8a3UL), ((UInt32_t)0x1f636c1bUL), ((UInt32_t)0x0e12b4c2UL), ((UInt32_t)0x02e1329eUL), ((UInt32_t)0xaf664fd1UL), ((UInt32_t)0xcad18115UL),
++        ((UInt32_t)0x6b2395e0UL), ((UInt32_t)0x333e92e1UL), ((UInt32_t)0x3b240b62UL), ((UInt32_t)0xeebeb922UL), ((UInt32_t)0x85b2a20eUL), ((UInt32_t)0xe6ba0d99UL),
++        ((UInt32_t)0xde720c8cUL), ((UInt32_t)0x2da2f728UL), ((UInt32_t)0xd0127845UL), ((UInt32_t)0x95b794fdUL), ((UInt32_t)0x647d0862UL), ((UInt32_t)0xe7ccf5f0UL),
++        ((UInt32_t)0x5449a36fUL), ((UInt32_t)0x877d48faUL), ((UInt32_t)0xc39dfd27UL), ((UInt32_t)0xf33e8d1eUL), ((UInt32_t)0x0a476341UL), ((UInt32_t)0x992eff74UL),
++        ((UInt32_t)0x3a6f6eabUL), ((UInt32_t)0xf4f8fd37UL), ((UInt32_t)0xa812dc60UL), ((UInt32_t)0xa1ebddf8UL), ((UInt32_t)0x991be14cUL), ((UInt32_t)0xdb6e6b0dUL),
++        ((UInt32_t)0xc67b5510UL), ((UInt32_t)0x6d672c37UL), ((UInt32_t)0x2765d43bUL), ((UInt32_t)0xdcd0e804UL), ((UInt32_t)0xf1290dc7UL), ((UInt32_t)0xcc00ffa3UL),
++        ((UInt32_t)0xb5390f92UL), ((UInt32_t)0x690fed0bUL), ((UInt32_t)0x667b9ffbUL), ((UInt32_t)0xcedb7d9cUL), ((UInt32_t)0xa091cf0bUL), ((UInt32_t)0xd9155ea3UL),
++        ((UInt32_t)0xbb132f88UL), ((UInt32_t)0x515bad24UL), ((UInt32_t)0x7b9479bfUL), ((UInt32_t)0x763bd6ebUL), ((UInt32_t)0x37392eb3UL), ((UInt32_t)0xcc115979UL),
++        ((UInt32_t)0x8026e297UL), ((UInt32_t)0xf42e312dUL), ((UInt32_t)0x6842ada7UL), ((UInt32_t)0xc66a2b3bUL), ((UInt32_t)0x12754cccUL), ((UInt32_t)0x782ef11cUL),
++        ((UInt32_t)0x6a124237UL), ((UInt32_t)0xb79251e7UL), ((UInt32_t)0x06a1bbe6UL), ((UInt32_t)0x4bfb6350UL), ((UInt32_t)0x1a6b1018UL), ((UInt32_t)0x11caedfaUL),
++        ((UInt32_t)0x3d25bdd8UL), ((UInt32_t)0xe2e1c3c9UL), ((UInt32_t)0x44421659UL), ((UInt32_t)0x0a121386UL), ((UInt32_t)0xd90cec6eUL), ((UInt32_t)0xd5abea2aUL),
++        ((UInt32_t)0x64af674eUL), ((UInt32_t)0xda86a85fUL), ((UInt32_t)0xbebfe988UL), ((UInt32_t)0x64e4c3feUL), ((UInt32_t)0x9dbc8057UL), ((UInt32_t)0xf0f7c086UL),
++        ((UInt32_t)0x60787bf8UL), ((UInt32_t)0x6003604dUL), ((UInt32_t)0xd1fd8346UL), ((UInt32_t)0xf6381fb0UL), ((UInt32_t)0x7745ae04UL), ((UInt32_t)0xd736fcccUL),
++        ((UInt32_t)0x83426b33UL), ((UInt32_t)0xf01eab71UL), ((UInt32_t)0xb0804187UL), ((UInt32_t)0x3c005e5fUL), ((UInt32_t)0x77a057beUL), ((UInt32_t)0xbde8ae24UL),
++        ((UInt32_t)0x55464299UL), ((UInt32_t)0xbf582e61UL), ((UInt32_t)0x4e58f48fUL), ((UInt32_t)0xf2ddfda2UL), ((UInt32_t)0xf474ef38UL), ((UInt32_t)0x8789bdc2UL),
++        ((UInt32_t)0x5366f9c3UL), ((UInt32_t)0xc8b38e74UL), ((UInt32_t)0xb475f255UL), ((UInt32_t)0x46fcd9b9UL), ((UInt32_t)0x7aeb2661UL), ((UInt32_t)0x8b1ddf84UL),
++        ((UInt32_t)0x846a0e79UL), ((UInt32_t)0x915f95e2UL), ((UInt32_t)0x466e598eUL), ((UInt32_t)0x20b45770UL), ((UInt32_t)0x8cd55591UL), ((UInt32_t)0xc902de4cUL),
++        ((UInt32_t)0xb90bace1UL), ((UInt32_t)0xbb8205d0UL), ((UInt32_t)0x11a86248UL), ((UInt32_t)0x7574a99eUL), ((UInt32_t)0xb77f19b6UL), ((UInt32_t)0xe0a9dc09UL),
++        ((UInt32_t)0x662d09a1UL), ((UInt32_t)0xc4324633UL), ((UInt32_t)0xe85a1f02UL), ((UInt32_t)0x09f0be8cUL), ((UInt32_t)0x4a99a025UL), ((UInt32_t)0x1d6efe10UL),
++        ((UInt32_t)0x1ab93d1dUL), ((UInt32_t)0x0ba5a4dfUL), ((UInt32_t)0xa186f20fUL), ((UInt32_t)0x2868f169UL), ((UInt32_t)0xdcb7da83UL), ((UInt32_t)0x573906feUL),
++        ((UInt32_t)0xa1e2ce9bUL), ((UInt32_t)0x4fcd7f52UL), ((UInt32_t)0x50115e01UL), ((UInt32_t)0xa70683faUL), ((UInt32_t)0xa002b5c4UL), ((UInt32_t)0x0de6d027UL),
++        ((UInt32_t)0x9af88c27UL), ((UInt32_t)0x773f8641UL), ((UInt32_t)0xc3604c06UL), ((UInt32_t)0x61a806b5UL), ((UInt32_t)0xf0177a28UL), ((UInt32_t)0xc0f586e0UL),
++        ((UInt32_t)0x006058aaUL), ((UInt32_t)0x30dc7d62UL), ((UInt32_t)0x11e69ed7UL), ((UInt32_t)0x2338ea63UL), ((UInt32_t)0x53c2dd94UL), ((UInt32_t)0xc2c21634UL),
++        ((UInt32_t)0xbbcbee56UL), ((UInt32_t)0x90bcb6deUL), ((UInt32_t)0xebfc7da1UL), ((UInt32_t)0xce591d76UL), ((UInt32_t)0x6f05e409UL), ((UInt32_t)0x4b7c0188UL),
++        ((UInt32_t)0x39720a3dUL), ((UInt32_t)0x7c927c24UL), ((UInt32_t)0x86e3725fUL), ((UInt32_t)0x724d9db9UL), ((UInt32_t)0x1ac15bb4UL), ((UInt32_t)0xd39eb8fcUL),
++        ((UInt32_t)0xed545578UL), ((UInt32_t)0x08fca5b5UL), ((UInt32_t)0xd83d7cd3UL), ((UInt32_t)0x4dad0fc4UL), ((UInt32_t)0x1e50ef5eUL), ((UInt32_t)0xb161e6f8UL),
++        ((UInt32_t)0xa28514d9UL), ((UInt32_t)0x6c51133cUL), ((UInt32_t)0x6fd5c7e7UL), ((UInt32_t)0x56e14ec4UL), ((UInt32_t)0x362abfceUL), ((UInt32_t)0xddc6c837UL),
++        ((UInt32_t)0xd79a3234UL), ((UInt32_t)0x92638212UL), ((UInt32_t)0x670efa8eUL), ((UInt32_t)0x406000e0UL)
++    },
++    {
++        ((UInt32_t)0x3a39ce37UL), ((UInt32_t)0xd3faf5cfUL), ((UInt32_t)0xabc27737UL), ((UInt32_t)0x5ac52d1bUL), ((UInt32_t)0x5cb0679eUL), ((UInt32_t)0x4fa33742UL),
++        ((UInt32_t)0xd3822740UL), ((UInt32_t)0x99bc9bbeUL), ((UInt32_t)0xd5118e9dUL), ((UInt32_t)0xbf0f7315UL), ((UInt32_t)0xd62d1c7eUL), ((UInt32_t)0xc700c47bUL),
++        ((UInt32_t)0xb78c1b6bUL), ((UInt32_t)0x21a19045UL), ((UInt32_t)0xb26eb1beUL), ((UInt32_t)0x6a366eb4UL), ((UInt32_t)0x5748ab2fUL), ((UInt32_t)0xbc946e79UL),
++        ((UInt32_t)0xc6a376d2UL), ((UInt32_t)0x6549c2c8UL), ((UInt32_t)0x530ff8eeUL), ((UInt32_t)0x468dde7dUL), ((UInt32_t)0xd5730a1dUL), ((UInt32_t)0x4cd04dc6UL),
++        ((UInt32_t)0x2939bbdbUL), ((UInt32_t)0xa9ba4650UL), ((UInt32_t)0xac9526e8UL), ((UInt32_t)0xbe5ee304UL), ((UInt32_t)0xa1fad5f0UL), ((UInt32_t)0x6a2d519aUL),
++        ((UInt32_t)0x63ef8ce2UL), ((UInt32_t)0x9a86ee22UL), ((UInt32_t)0xc089c2b8UL), ((UInt32_t)0x43242ef6UL), ((UInt32_t)0xa51e03aaUL), ((UInt32_t)0x9cf2d0a4UL),
++        ((UInt32_t)0x83c061baUL), ((UInt32_t)0x9be96a4dUL), ((UInt32_t)0x8fe51550UL), ((UInt32_t)0xba645bd6UL), ((UInt32_t)0x2826a2f9UL), ((UInt32_t)0xa73a3ae1UL),
++        ((UInt32_t)0x4ba99586UL), ((UInt32_t)0xef5562e9UL), ((UInt32_t)0xc72fefd3UL), ((UInt32_t)0xf752f7daUL), ((UInt32_t)0x3f046f69UL), ((UInt32_t)0x77fa0a59UL),
++        ((UInt32_t)0x80e4a915UL), ((UInt32_t)0x87b08601UL), ((UInt32_t)0x9b09e6adUL), ((UInt32_t)0x3b3ee593UL), ((UInt32_t)0xe990fd5aUL), ((UInt32_t)0x9e34d797UL),
++        ((UInt32_t)0x2cf0b7d9UL), ((UInt32_t)0x022b8b51UL), ((UInt32_t)0x96d5ac3aUL), ((UInt32_t)0x017da67dUL), ((UInt32_t)0xd1cf3ed6UL), ((UInt32_t)0x7c7d2d28UL),
++        ((UInt32_t)0x1f9f25cfUL), ((UInt32_t)0xadf2b89bUL), ((UInt32_t)0x5ad6b472UL), ((UInt32_t)0x5a88f54cUL), ((UInt32_t)0xe029ac71UL), ((UInt32_t)0xe019a5e6UL),
++        ((UInt32_t)0x47b0acfdUL), ((UInt32_t)0xed93fa9bUL), ((UInt32_t)0xe8d3c48dUL), ((UInt32_t)0x283b57ccUL), ((UInt32_t)0xf8d56629UL), ((UInt32_t)0x79132e28UL),
++        ((UInt32_t)0x785f0191UL), ((UInt32_t)0xed756055UL), ((UInt32_t)0xf7960e44UL), ((UInt32_t)0xe3d35e8cUL), ((UInt32_t)0x15056dd4UL), ((UInt32_t)0x88f46dbaUL),
++        ((UInt32_t)0x03a16125UL), ((UInt32_t)0x0564f0bdUL), ((UInt32_t)0xc3eb9e15UL), ((UInt32_t)0x3c9057a2UL), ((UInt32_t)0x97271aecUL), ((UInt32_t)0xa93a072aUL),
++        ((UInt32_t)0x1b3f6d9bUL), ((UInt32_t)0x1e6321f5UL), ((UInt32_t)0xf59c66fbUL), ((UInt32_t)0x26dcf319UL), ((UInt32_t)0x7533d928UL), ((UInt32_t)0xb155fdf5UL),
++        ((UInt32_t)0x03563482UL), ((UInt32_t)0x8aba3cbbUL), ((UInt32_t)0x28517711UL), ((UInt32_t)0xc20ad9f8UL), ((UInt32_t)0xabcc5167UL), ((UInt32_t)0xccad925fUL),
++        ((UInt32_t)0x4de81751UL), ((UInt32_t)0x3830dc8eUL), ((UInt32_t)0x379d5862UL), ((UInt32_t)0x9320f991UL), ((UInt32_t)0xea7a90c2UL), ((UInt32_t)0xfb3e7bceUL),
++        ((UInt32_t)0x5121ce64UL), ((UInt32_t)0x774fbe32UL), ((UInt32_t)0xa8b6e37eUL), ((UInt32_t)0xc3293d46UL), ((UInt32_t)0x48de5369UL), ((UInt32_t)0x6413e680UL),
++        ((UInt32_t)0xa2ae0810UL), ((UInt32_t)0xdd6db224UL), ((UInt32_t)0x69852dfdUL), ((UInt32_t)0x09072166UL), ((UInt32_t)0xb39a460aUL), ((UInt32_t)0x6445c0ddUL),
++        ((UInt32_t)0x586cdecfUL), ((UInt32_t)0x1c20c8aeUL), ((UInt32_t)0x5bbef7ddUL), ((UInt32_t)0x1b588d40UL), ((UInt32_t)0xccd2017fUL), ((UInt32_t)0x6bb4e3bbUL),
++        ((UInt32_t)0xdda26a7eUL), ((UInt32_t)0x3a59ff45UL), ((UInt32_t)0x3e350a44UL), ((UInt32_t)0xbcb4cdd5UL), ((UInt32_t)0x72eacea8UL), ((UInt32_t)0xfa6484bbUL),
++        ((UInt32_t)0x8d6612aeUL), ((UInt32_t)0xbf3c6f47UL), ((UInt32_t)0xd29be463UL), ((UInt32_t)0x542f5d9eUL), ((UInt32_t)0xaec2771bUL), ((UInt32_t)0xf64e6370UL),
++        ((UInt32_t)0x740e0d8dUL), ((UInt32_t)0xe75b1357UL), ((UInt32_t)0xf8721671UL), ((UInt32_t)0xaf537d5dUL), ((UInt32_t)0x4040cb08UL), ((UInt32_t)0x4eb4e2ccUL),
++        ((UInt32_t)0x34d2466aUL), ((UInt32_t)0x0115af84UL), ((UInt32_t)0xe1b00428UL), ((UInt32_t)0x95983a1dUL), ((UInt32_t)0x06b89fb4UL), ((UInt32_t)0xce6ea048UL),
++        ((UInt32_t)0x6f3f3b82UL), ((UInt32_t)0x3520ab82UL), ((UInt32_t)0x011a1d4bUL), ((UInt32_t)0x277227f8UL), ((UInt32_t)0x611560b1UL), ((UInt32_t)0xe7933fdcUL),
++        ((UInt32_t)0xbb3a792bUL), ((UInt32_t)0x344525bdUL), ((UInt32_t)0xa08839e1UL), ((UInt32_t)0x51ce794bUL), ((UInt32_t)0x2f32c9b7UL), ((UInt32_t)0xa01fbac9UL),
++        ((UInt32_t)0xe01cc87eUL), ((UInt32_t)0xbcc7d1f6UL), ((UInt32_t)0xcf0111c3UL), ((UInt32_t)0xa1e8aac7UL), ((UInt32_t)0x1a908749UL), ((UInt32_t)0xd44fbd9aUL),
++        ((UInt32_t)0xd0dadecbUL), ((UInt32_t)0xd50ada38UL), ((UInt32_t)0x0339c32aUL), ((UInt32_t)0xc6913667UL), ((UInt32_t)0x8df9317cUL), ((UInt32_t)0xe0b12b4fUL),
++        ((UInt32_t)0xf79e59b7UL), ((UInt32_t)0x43f5bb3aUL), ((UInt32_t)0xf2d519ffUL), ((UInt32_t)0x27d9459cUL), ((UInt32_t)0xbf97222cUL), ((UInt32_t)0x15e6fc2aUL),
++        ((UInt32_t)0x0f91fc71UL), ((UInt32_t)0x9b941525UL), ((UInt32_t)0xfae59361UL), ((UInt32_t)0xceb69cebUL), ((UInt32_t)0xc2a86459UL), ((UInt32_t)0x12baa8d1UL),
++        ((UInt32_t)0xb6c1075eUL), ((UInt32_t)0xe3056a0cUL), ((UInt32_t)0x10d25065UL), ((UInt32_t)0xcb03a442UL), ((UInt32_t)0xe0ec6e0eUL), ((UInt32_t)0x1698db3bUL),
++        ((UInt32_t)0x4c98a0beUL), ((UInt32_t)0x3278e964UL), ((UInt32_t)0x9f1f9532UL), ((UInt32_t)0xe0d392dfUL), ((UInt32_t)0xd3a0342bUL), ((UInt32_t)0x8971f21eUL),
++        ((UInt32_t)0x1b0a7441UL), ((UInt32_t)0x4ba3348cUL), ((UInt32_t)0xc5be7120UL), ((UInt32_t)0xc37632d8UL), ((UInt32_t)0xdf359f8dUL), ((UInt32_t)0x9b992f2eUL),
++        ((UInt32_t)0xe60b6f47UL), ((UInt32_t)0x0fe3f11dUL), ((UInt32_t)0xe54cda54UL), ((UInt32_t)0x1edad891UL), ((UInt32_t)0xce6279cfUL), ((UInt32_t)0xcd3e7e6fUL),
++        ((UInt32_t)0x1618b166UL), ((UInt32_t)0xfd2c1d05UL), ((UInt32_t)0x848fd2c5UL), ((UInt32_t)0xf6fb2299UL), ((UInt32_t)0xf523f357UL), ((UInt32_t)0xa6327623UL),
++        ((UInt32_t)0x93a83531UL), ((UInt32_t)0x56cccd02UL), ((UInt32_t)0xacf08162UL), ((UInt32_t)0x5a75ebb5UL), ((UInt32_t)0x6e163697UL), ((UInt32_t)0x88d273ccUL),
++        ((UInt32_t)0xde966292UL), ((UInt32_t)0x81b949d0UL), ((UInt32_t)0x4c50901bUL), ((UInt32_t)0x71c65614UL), ((UInt32_t)0xe6c6c7bdUL), ((UInt32_t)0x327a140aUL),
++        ((UInt32_t)0x45e1d006UL), ((UInt32_t)0xc3f27b9aUL), ((UInt32_t)0xc9aa53fdUL), ((UInt32_t)0x62a80f00UL), ((UInt32_t)0xbb25bfe2UL), ((UInt32_t)0x35bdd2f6UL),
++        ((UInt32_t)0x71126905UL), ((UInt32_t)0xb2040222UL), ((UInt32_t)0xb6cbcf7cUL), ((UInt32_t)0xcd769c2bUL), ((UInt32_t)0x53113ec0UL), ((UInt32_t)0x1640e3d3UL),
++        ((UInt32_t)0x38abbd60UL), ((UInt32_t)0x2547adf0UL), ((UInt32_t)0xba38209cUL), ((UInt32_t)0xf746ce76UL), ((UInt32_t)0x77afa1c5UL), ((UInt32_t)0x20756060UL),
++        ((UInt32_t)0x85cbfe4eUL), ((UInt32_t)0x8ae88dd8UL), ((UInt32_t)0x7aaaf9b0UL), ((UInt32_t)0x4cf9aa7eUL), ((UInt32_t)0x1948c25cUL), ((UInt32_t)0x02fb8a8cUL),
++        ((UInt32_t)0x01c36ae4UL), ((UInt32_t)0xd6ebe1f9UL), ((UInt32_t)0x90d4f869UL), ((UInt32_t)0xa65cdea0UL), ((UInt32_t)0x3f09252dUL), ((UInt32_t)0xc208e69fUL),
++        ((UInt32_t)0xb74e6132UL), ((UInt32_t)0xce77e25bUL), ((UInt32_t)0x578fdfe3UL), ((UInt32_t)0x3ac372e6UL)
++    }
++};
++
++LOCAL UInt32_t
++plextor_auth_load_be32(p)
++	const Uchar *p;
++{
++    return ((UInt32_t)p[0] << 24) |
++           ((UInt32_t)p[1] << 16) |
++           ((UInt32_t)p[2] << 8) |
++           (UInt32_t)p[3];
++}
++
++LOCAL void
++plextor_auth_store_be32(p, x)
++	Uchar *p;
++	UInt32_t x;
++{
++    p[0] = (Uchar)(x >> 24);
++    p[1] = (Uchar)(x >> 16);
++    p[2] = (Uchar)(x >> 8);
++    p[3] = (Uchar)x;
++}
++
++LOCAL UInt32_t
++plextor_auth_bf_f(ctx, x)
++	const plextor_auth_blowfish_ctx *ctx;
++	UInt32_t x;
++{
++    UInt32_t y = ctx->s[0][(x >> 24) & 0xff] +
++                 ctx->s[1][(x >> 16) & 0xff];
++    y ^= ctx->s[2][(x >> 8) & 0xff];
++    y += ctx->s[3][x & 0xff];
++    return y;
++}
++
++LOCAL void
++plextor_auth_bf_encrypt_words(ctx, left, right)
++	const plextor_auth_blowfish_ctx *ctx;
++	UInt32_t *left;
++	UInt32_t *right;
++{
++    UInt32_t l = *left;
++    UInt32_t r = *right;
++    UInt32_t t;
++    unsigned i;
++
++    for (i = 0; i < 16; ++i) {
++        l ^= ctx->p[i];
++        r ^= plextor_auth_bf_f(ctx, l);
++        t = l; l = r; r = t;
++    }
++    {
++        t = l; l = r; r = t;
++    }
++    r ^= ctx->p[16];
++    l ^= ctx->p[17];
++
++    *left = l;
++    *right = r;
++}
++
++LOCAL void
++plextor_auth_bf_set_key(ctx, key)
++	plextor_auth_blowfish_ctx *ctx;
++	const Uchar *key;
++{
++    unsigned j = 0;
++    unsigned i;
++    unsigned n;
++    unsigned box;
++    UInt32_t w;
++    UInt32_t l = 0;
++    UInt32_t r = 0;
++
++    memcpy(ctx->p, plextor_auth_bf_init_p, sizeof(ctx->p));
++    memcpy(ctx->s, plextor_auth_bf_init_s, sizeof(ctx->s));
++
++    for (i = 0; i < 18; ++i) {
++        w = 0;
++        for (n = 0; n < 4; ++n) {
++            w = (w << 8) | key[j];
++            j = (j + 1) & 15;
++        }
++        ctx->p[i] ^= w;
++    }
++
++    for (i = 0; i < 18; i += 2) {
++        plextor_auth_bf_encrypt_words(ctx, &l, &r);
++        ctx->p[i] = l;
++        ctx->p[i + 1] = r;
++    }
++    for (box = 0; box < 4; ++box) {
++        for (i = 0; i < 256; i += 2) {
++            plextor_auth_bf_encrypt_words(ctx, &l, &r);
++            ctx->s[box][i] = l;
++            ctx->s[box][i + 1] = r;
++        }
++    }
++}
++
++LOCAL void
++plextor_auth_bf_decrypt_block(ctx, in, out)
++	const plextor_auth_blowfish_ctx *ctx;
++	const Uchar *in;
++	Uchar *out;
++{
++    UInt32_t l = plextor_auth_load_be32(in);
++    UInt32_t r = plextor_auth_load_be32(in + 4);
++    UInt32_t t;
++    int i;
++
++    for (i = 17; i > 1; --i) {
++        l ^= ctx->p[i];
++        r ^= plextor_auth_bf_f(ctx, l);
++        t = l; l = r; r = t;
++    }
++    {
++        t = l; l = r; r = t;
++    }
++    r ^= ctx->p[1];
++    l ^= ctx->p[0];
++
++    plextor_auth_store_be32(out, l);
++    plextor_auth_store_be32(out + 4, r);
++}
++
++/* PlexTools Professional XL 3.16 computes the protected-command response as:
++ *   key      = MD5(seed)
++ *   clear    = Blowfish-ECB-DECRYPT(challenge[0..7], key) ||
++ *              Blowfish-ECB-DECRYPT(challenge[8..15], key)
++ *   response = MD5(clear)
++ * The recovered transform matches all 43 captured Premium2 D4/D5 exchanges. */
++EXPORT void
++plextor_auth_response(challenge, response)
++	const Uchar *challenge;
++	Uchar *response;
++{
++    static const Uchar seed[16] = {
++        0x3d, 0x14, 0x4a, 0x9c, 0x2b, 0x4a, 0x53, 0x63,
++        0x25, 0x98, 0xf2, 0xa5, 0xc4, 0xad, 0x03, 0xcf
++    };
++    Uchar key[16];
++    Uchar clear[16];
++    plextor_auth_blowfish_ctx ctx;
++
++    plextor_auth_md5_16(seed, key);
++    plextor_auth_bf_set_key(&ctx, key);
++    plextor_auth_bf_decrypt_block(&ctx, challenge, clear);
++    plextor_auth_bf_decrypt_block(&ctx, challenge + 8, clear + 8);
++    plextor_auth_md5_16(clear, response);
++}
+diff --git a/cdrecord/plextor_auth.h b/cdrecord/plextor_auth.h
+new file mode 100644
+index 0000000..687647d
+--- /dev/null
++++ b/cdrecord/plextor_auth.h
+@@ -0,0 +1,26 @@
++/*
++ * Plextor protected-command challenge-response interface.
++ *
++ * This file is dedicated to the public domain.  To the extent that a
++ * public-domain dedication is not effective in a particular jurisdiction,
++ * permission is granted to anyone to use, copy, modify, publish, distribute,
++ * sublicense, and/or sell this software for any purpose, with or without fee
++ * and with or without attribution.
++ */
++#ifndef _PLEXTOR_AUTH_H
++#define _PLEXTOR_AUTH_H
++
++#include <schily/mconfig.h>
++#include <schily/utypes.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++extern void plextor_auth_response __PR((const Uchar *challenge, Uchar *response));
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _PLEXTOR_AUTH_H */
